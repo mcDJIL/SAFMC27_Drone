@@ -1,0 +1,28 @@
+menu "Button configuration"
+
+config BUTTON_MAX_LISTENERS
+    int "Maximum number of button listeners"
+    range 1 64
+    default 8
+
+config BUTTON_DEBOUNCE_MS
+    int "Debounce time in milliseconds"
+    range 1 1000
+    default 30
+
+config BUTTON_POLL_INTERVAL_MS
+    int "Polling interval in milliseconds"
+    range 1 1000
+    default 20
+
+config BUTTON_TASK_STACK_SIZE
+    int "Button task stack size"
+    range 1024 16384
+    default 4096
+
+config BUTTON_TASK_PRIORITY
+    int "Button task priority"
+    range 1 25
+    default 5
+
+endmenu
