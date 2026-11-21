@@ -1,3 +1,17 @@
 {
-    "idf.currentSetup": "/home/areal/.espressif/v6.1/esp-idf"
+    "idf.currentSetup": "/home/areal/.espressif/v6.1/esp-idf",
+    "idf.port": "/dev/ttyACM1",
+    "idf.openOcdConfigs": [
+        "board/esp32c3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c3"
+    },
+    "clangd.path": "/home/areal/.espressif/tools/esp-clangd/esp-21.1.3_20260408/esp-clangd/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/home/areal/Caksa/safmc-2027/SAFMC27_Drone/build"
+    ],
+    "idf.flashType": "UART"
 }
