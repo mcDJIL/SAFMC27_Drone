@@ -1,6 +1,6 @@
 {
     "idf.currentSetup": "/home/areal/.espressif/v6.1/esp-idf",
-    "idf.port": "/dev/ttyACM1",
+    "idf.port": "/dev/ttyACM0",
     "idf.openOcdConfigs": [
         "board/esp32c3-builtin.cfg"
     ],

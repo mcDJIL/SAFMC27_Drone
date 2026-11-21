@@ -408,7 +408,5 @@ void app_main(void)
     ESP_ERROR_CHECK(lora_start_receive(s_radio, on_rx, NULL));
     configASSERT(xTaskCreate(drop_task, "drone_drop", 4096, NULL, 5, NULL) == pdPASS);
     configASSERT(xTaskCreate(status_task, "drone_status", 3072, NULL, 2, NULL) == pdPASS);
-    ESP_LOGI(TAG, "Drone Node 5 aktif: slot 6, ring 1->2->5->1, LoRa RST=GPIO2 DIO0=GPIO8");
-    ESP_LOGW(TAG, "Output servo=%s; penjatuhan fisik harus diverifikasi saat uji meja",
-             DRONE_ACTUATOR_MODE ? "AKTIF" : "NONAKTIF");
+    ESP_LOGI(TAG, "Drone Node 5 aktif: slot 6, ring 1->2->5->1");
 }
