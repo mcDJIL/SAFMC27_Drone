@@ -15,8 +15,17 @@
 #error "Atur CONFIG_FREERTOS_HZ=1000 untuk firmware CAKSA"
 #endif
 
-#define DRONE_UNIT_ID             1
+typedef enum {
+    NODE_MAIN   = 1,
+    NODE_PANTRY = 2,
+    NODE_ICE    = 3,
+    NODE_OVEN   = 4,
+    NODE_DRONE  = 5
+} node_id_t;
 
+static const uint8_t s_node_id = NODE_DRONE;
+
+#define DRONE_UNIT_ID             1
 #define PKT_LEN                   3
 #define SLOT_COUNT                6
 
@@ -45,9 +54,10 @@
 
 #define MAIN_FRESH_MS             250
 #define PANTRY_FRESH_MS           250
-#define STATUS_INTERVAL_MS        5000
+#define STATUS_INTERVAL_MS        30000
+#define TX_ERROR_LOG_MS          10000
 #define SERVO_TASK_POLL_MS        5
-#define LORA_FREQ_HZ              433000000
+#define LORA_FREQ_HZ              433000000UL
 #define LORA_TX_POWER_MW          9
 
 #define CMD_NONE                  0
@@ -59,14 +69,18 @@
 #define PAYLOAD_EMPTY             0
 #define PAYLOAD_RED               1
 #define PAYLOAD_GREEN             2
+#define PAYLOAD_BALL              3
+#define PAYLOAD_CUBE              4
+#define PAYLOAD_FAMILY_PANTRY     1
+#define PAYLOAD_FAMILY_ICE_OVEN   2
 
-enum {
-    NODE_MAIN   = 1,
-    NODE_PANTRY = 2,
-    NODE_ICE    = 3,
-    NODE_OVEN   = 4,
-    NODE_DRONE  = 5
-};
+#if DRONE_ACTUATOR_MODE && (!DRONE_HW_ARMED || !DRONE_SERVO_CALIBRATED)
+#error "Aktuator Drone butuh persetujuan arming dan kalibrasi servo"
+#endif
+
+#if DRONE_ACTUATOR_MODE && !defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+#error "GPIO20/21 servo membutuhkan konsol USB Serial JTAG dan UART0 nonaktif"
+#endif
 
 _Static_assert(PKT_LEN == 3, "Panjang paket LoRa harus 3 byte");
 _Static_assert(DRONE_UNIT_ID >= 1 && DRONE_UNIT_ID <= 3, "ID Drone tidak valid");
@@ -86,6 +100,8 @@ static uint8_t s_slots[SLOT_COUNT];
 static bool s_releasing[SLOT_COUNT];
 static int64_t s_servo_return_us[SLOT_COUNT];
 static uint8_t s_latched_cmd;
+static uint8_t s_idle_frames;
+static uint8_t s_payload_family = PAYLOAD_FAMILY_PANTRY;
 static uint8_t s_pending_cmd;
 static int64_t s_pending_cmd_us;
 static uint16_t s_last_event_token;
@@ -100,6 +116,9 @@ static int64_t s_last_pantry_us;
 static uint32_t s_rx_main;
 static uint32_t s_tx_drone;
 static uint32_t s_tx_errors;
+static uint32_t s_tx_error_logged_ms;
+static bool s_tx_error_active;
+static bool s_tx_error_notified;
 static uint32_t s_drops_ok;
 static uint32_t s_drops_rejected;
 
@@ -107,6 +126,8 @@ static const char *payload_name(uint8_t payload)
 {
     if (payload == PAYLOAD_RED) return "MERAH";
     if (payload == PAYLOAD_GREEN) return "HIJAU";
+    if (payload == PAYLOAD_BALL) return "BALL";
+    if (payload == PAYLOAD_CUBE) return "CUBE";
     return "KOSONG";
 }
 
@@ -115,21 +136,62 @@ static void slots_to_text(char text[SLOT_COUNT + 1])
     portENTER_CRITICAL(&s_mux);
     for (unsigned i = 0; i < SLOT_COUNT; ++i) {
         text[i] = s_slots[i] == PAYLOAD_RED ? 'R' :
-                  s_slots[i] == PAYLOAD_GREEN ? 'G' : '-';
+                  s_slots[i] == PAYLOAD_GREEN ? 'G' :
+                  s_slots[i] == PAYLOAD_BALL ? 'B' :
+                  s_slots[i] == PAYLOAD_CUBE ? 'C' : '-';
     }
     portEXIT_CRITICAL(&s_mux);
     text[SLOT_COUNT] = '\0';
 }
 
-static uint16_t pack_slots(void)
+static bool pack_slots(uint16_t *packed_out)
 {
     uint16_t packed = 0;
+    bool valid = true;
     portENTER_CRITICAL(&s_mux);
     for (unsigned i = 0; i < SLOT_COUNT; ++i) {
-        packed |= (uint16_t)((s_slots[i] & 3u) << (10 - 2 * i));
+        uint8_t payload = s_slots[i];
+        uint8_t value = 0;
+        if (payload == PAYLOAD_EMPTY) {
+            value = 0;
+        } else if (s_payload_family == PAYLOAD_FAMILY_PANTRY) {
+            if (payload == PAYLOAD_RED) value = 1;
+            else if (payload == PAYLOAD_GREEN) value = 2;
+            else valid = false;
+        } else if (s_payload_family == PAYLOAD_FAMILY_ICE_OVEN) {
+            if (payload == PAYLOAD_BALL) value = 1;
+            else if (payload == PAYLOAD_CUBE) value = 2;
+            else valid = false;
+        } else {
+            valid = false;
+        }
+        packed |= (uint16_t)(value << (10 - 2 * i));
     }
     portEXIT_CRITICAL(&s_mux);
-    return packed;
+    if (valid) *packed_out = packed;
+    return valid;
+}
+
+bool drone_select_payload_family(uint8_t family)
+{
+    if (family != PAYLOAD_FAMILY_PANTRY && family != PAYLOAD_FAMILY_ICE_OVEN) return false;
+    bool empty = true;
+    portENTER_CRITICAL(&s_mux);
+    for (unsigned i = 0; i < SLOT_COUNT; ++i) {
+        if (s_slots[i] != PAYLOAD_EMPTY || s_releasing[i]) {
+            empty = false;
+            break;
+        }
+    }
+    if (empty) s_payload_family = family;
+    portEXIT_CRITICAL(&s_mux);
+    if (empty) {
+        ESP_LOGI(TAG, "Mode payload dipilih: %s",
+                 family == PAYLOAD_FAMILY_PANTRY ? "MERAH-HIJAU" : "BALL-CUBE");
+    } else {
+        ESP_LOGW(TAG, "Pergantian jenis payload ditolak: magazine belum kosong");
+    }
+    return empty;
 }
 
 static uint32_t pulse_to_duty(uint16_t pulse_us)
@@ -187,7 +249,7 @@ static void handle_pick_event(uint8_t red, uint8_t green, uint8_t event)
     if (accepted) {
         char text[SLOT_COUNT + 1];
         slots_to_text(text);
-        ESP_LOGI(TAG, "PICK TERCATAT: slot %u %s, magazine=%s", slot + 1u, payload_name(payload), text);
+        ESP_LOGI(TAG, "PICK: slot %u=%s, magazine=%s", slot + 1u, payload_name(payload), text);
     } else if (conflict) {
         ESP_LOGE(TAG, "Konflik sinkronisasi pada slot %u, picking tidak dicatat", slot + 1u);
     }
@@ -208,7 +270,12 @@ static bool drop_allowed(int64_t now)
 static void start_drop(uint8_t cmd)
 {
     int64_t now = esp_timer_get_time();
-    uint8_t payload = cmd == CMD_MAIN1 ? PAYLOAD_GREEN : PAYLOAD_RED;
+    uint8_t payload;
+    portENTER_CRITICAL(&s_mux);
+    payload = cmd == CMD_MAIN1 ?
+              (s_payload_family == PAYLOAD_FAMILY_PANTRY ? PAYLOAD_GREEN : PAYLOAD_BALL) :
+              (s_payload_family == PAYLOAD_FAMILY_PANTRY ? PAYLOAD_RED : PAYLOAD_CUBE);
+    portEXIT_CRITICAL(&s_mux);
     if (!drop_allowed(now)) {
         s_drops_rejected++;
         ESP_LOGW(TAG, "DROP ONE %s ditolak: dock, status LoRa, atau riwayat landing belum aman", payload_name(payload));
@@ -237,7 +304,7 @@ static void start_drop(uint8_t cmd)
         s_drops_ok++;
         char slots[SLOT_COUNT + 1];
         slots_to_text(slots);
-        ESP_LOGI(TAG, "DROP VIRTUAL %s: slot %d kosong, magazine=%s", payload_name(payload), selected + 1, slots);
+        ESP_LOGI(TAG, "DROP VIRTUAL: %s dari slot %d, magazine=%s", payload_name(payload), selected + 1, slots);
         return;
     }
     esp_err_t err = servo_write((unsigned)selected, SERVO_RELEASE_US);
@@ -250,7 +317,7 @@ static void start_drop(uint8_t cmd)
         return;
     }
     s_servo_return_us[selected] = now + (int64_t)SERVO_DROP_HOLD_MS * 1000;
-    ESP_LOGI(TAG, "DROP FISIK %s: servo slot %d diaktifkan, hasil jatuh belum diverifikasi sensor", payload_name(payload), selected + 1);
+    ESP_LOGI(TAG, "DROP FISIK: %s slot %d, servo bergerak (belum diverifikasi)", payload_name(payload), selected + 1);
 }
 
 static void service_servo_returns(void)
@@ -270,7 +337,7 @@ static void service_servo_returns(void)
         s_slots[i] = PAYLOAD_EMPTY;
         portEXIT_CRITICAL(&s_mux);
         s_drops_ok++;
-        ESP_LOGW(TAG, "Servo slot %u kembali, slot ditandai kosong berdasarkan perintah tanpa sensor", i + 1);
+        ESP_LOGI(TAG, "DROP SELESAI: slot %u ditandai kosong (tanpa sensor)", i + 1);
     }
 }
 
@@ -278,17 +345,42 @@ static void reply_node5(void)
 {
     int64_t now = esp_timer_get_time();
     if (!s_last_main_us || now - s_last_main_us > (int64_t)MAIN_FRESH_MS * 1000) return;
-    uint16_t packed = pack_slots();
+    uint16_t packed = 0;
+    if (!pack_slots(&packed)) {
+        s_tx_errors++;
+        uint32_t now_ms = (uint32_t)(now / 1000);
+        if (s_tx_errors == 1 || (uint32_t)(now_ms - s_tx_error_logged_ms) >= TX_ERROR_LOG_MS) {
+            ESP_LOGE(TAG, "Telemetri slot tidak cocok dengan protokol 12-bit, total gagal=%lu",
+                     (unsigned long)s_tx_errors);
+            s_tx_error_logged_ms = now_ms;
+            s_tx_error_notified = true;
+        }
+        s_tx_error_active = true;
+        return;
+    }
     const uint8_t pkt[PKT_LEN] = {
-        NODE_DRONE,
+        s_node_id,
         (uint8_t)((DRONE_UNIT_ID << 4) | ((packed >> 8) & 0x0Fu)),
         (uint8_t)(packed & 0xFFu)
     };
     esp_err_t err = lora_send(s_radio, pkt, PKT_LEN, 0);
-    if (err == ESP_OK) s_tx_drone++;
-    else {
+    if (err == ESP_OK) {
+        s_tx_drone++;
+        if (s_tx_error_active && s_tx_error_notified) {
+            ESP_LOGI(TAG, "TX Drone pulih, total gagal=%lu", (unsigned long)s_tx_errors);
+            s_tx_error_notified = false;
+        }
+        s_tx_error_active = false;
+    } else {
         s_tx_errors++;
-        ESP_LOGE(TAG, "Gagal kirim Node 5: %s", esp_err_to_name(err));
+        uint32_t now_ms = (uint32_t)(now / 1000);
+        if (s_tx_errors == 1 || (uint32_t)(now_ms - s_tx_error_logged_ms) >= TX_ERROR_LOG_MS) {
+            ESP_LOGE(TAG, "TX Drone gagal (%s), total=%lu", esp_err_to_name(err),
+                     (unsigned long)s_tx_errors);
+            s_tx_error_logged_ms = now_ms;
+            s_tx_error_notified = true;
+        }
+        s_tx_error_active = true;
     }
 }
 
@@ -308,16 +400,20 @@ static void on_rx(lora_t *radio, const lora_packet_t *p, void *ctx)
         s_last_main_us = now;
         s_rx_main++;
         if (cmd == CMD_NONE) {
-            s_latched_cmd = CMD_NONE;
-        } else if (cmd != s_latched_cmd) {
+            if (s_idle_frames < 2) s_idle_frames++;
+            if (s_idle_frames >= 2) s_latched_cmd = CMD_NONE;
+        } else {
+            s_idle_frames = 0;
+            if (cmd != s_latched_cmd) {
             s_latched_cmd = cmd;
             if (cmd == CMD_MAIN1 || cmd == CMD_MAIN2) {
                 s_pending_cmd = cmd;
                 s_pending_cmd_us = now;
             } else if (cmd == CMD_SW_DRONE) {
-                ESP_LOGW(TAG, "Switch Drone melalui PPM remote belum tersambung");
+                ESP_LOGW(TAG, "CMD Switch Drone diabaikan: trial hanya satu Drone");
             } else if (cmd == CMD_SW_CAM) {
-                ESP_LOGW(TAG, "Switch Cam melalui PPM remote belum tersambung");
+                ESP_LOGI(TAG, "CMD Switch Camera diterima; output PPM dikendalikan Main");
+            }
             }
         }
         return;
@@ -340,7 +436,7 @@ static void on_rx(lora_t *radio, const lora_packet_t *p, void *ctx)
     s_last_pantry_us = now;
     portEXIT_CRITICAL(&s_mux);
     if (changed) {
-        ESP_LOGI(TAG, "Status Pantry: %s", docked ? "MENDARAT" : "TIDAK MENDARAT");
+        ESP_LOGI(TAG, "DOCK: %s (laporan Pantry)", docked ? "MENDARAT" : "LEPAS");
     }
     handle_pick_event(red, green, event);
 
@@ -375,9 +471,17 @@ static void status_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
         char slots[SLOT_COUNT + 1];
         slots_to_text(slots);
-        ESP_LOGI(TAG, "Status: slot=%s, stok PRS R:%u G:%u, dock=%s, N1=%lu TX=%lu gagal=%lu drop=%lu tolak=%lu",
-                 slots, (unsigned)s_stock_red, (unsigned)s_stock_green,
-                 s_docked ? "YA" : "TIDAK",
+        uint8_t counts[PAYLOAD_CUBE + 1] = {0};
+        portENTER_CRITICAL(&s_mux);
+        for (unsigned i = 0; i < SLOT_COUNT; ++i) {
+            if (s_slots[i] <= PAYLOAD_CUBE) counts[s_slots[i]]++;
+        }
+        portEXIT_CRITICAL(&s_mux);
+        ESP_LOGI(TAG, "RING: dock=%s slot=%s isi R%u/G%u/B%u/C%u PRS=R%u/G%u RX1=%lu TX5=%lu gagal=%lu drop=%lu tolak=%lu",
+                 s_docked ? "YA" : "TIDAK", slots,
+                 (unsigned)counts[PAYLOAD_RED], (unsigned)counts[PAYLOAD_GREEN],
+                 (unsigned)counts[PAYLOAD_BALL], (unsigned)counts[PAYLOAD_CUBE],
+                 (unsigned)s_stock_red, (unsigned)s_stock_green,
                  (unsigned long)s_rx_main, (unsigned long)s_tx_drone,
                  (unsigned long)s_tx_errors, (unsigned long)s_drops_ok,
                  (unsigned long)s_drops_rejected);
@@ -408,5 +512,7 @@ void app_main(void)
     ESP_ERROR_CHECK(lora_start_receive(s_radio, on_rx, NULL));
     configASSERT(xTaskCreate(drop_task, "drone_drop", 4096, NULL, 5, NULL) == pdPASS);
     configASSERT(xTaskCreate(status_task, "drone_status", 3072, NULL, 2, NULL) == pdPASS);
-    ESP_LOGI(TAG, "Drone Node 5 aktif: slot 6, ring 1->2->5->1");
+    ESP_LOGI(TAG, "SIAP: Drone Node 5, ring 1->2->5->1, servo=%s, LoRa=%.0f mW",
+             DRONE_ACTUATOR_MODE ? "FISIK" : "VIRTUAL", (double)LORA_TX_POWER_MW);
+    ESP_LOGI(TAG, "Mode Pantry merah/hijau; Ball/Cube menunggu PRS Ice/Oven");
 }
